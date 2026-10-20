@@ -36,6 +36,10 @@ func init() {
 }
 
 func unmarshalManifestList(b []byte) (distribution.Manifest, v1.Descriptor, error) {
+	if err := validateManifestList(b); err != nil {
+		return nil, v1.Descriptor{}, err
+	}
+
 	m := &DeserializedManifestList{}
 	if err := m.UnmarshalJSON(b); err != nil {
 		return nil, v1.Descriptor{}, err
@@ -196,8 +200,8 @@ func (m DeserializedManifestList) Payload() (string, []byte, error) {
 // contains fields that belong to a manifest
 func validateManifestList(b []byte) error {
 	var doc struct {
-		Config interface{} `json:"config,omitempty"`
-		Layers interface{} `json:"layers,omitempty"`
+		Config any `json:"config,omitempty"`
+		Layers any `json:"layers,omitempty"`
 	}
 	if err := json.Unmarshal(b, &doc); err != nil {
 		return err

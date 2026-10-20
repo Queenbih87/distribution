@@ -15,6 +15,7 @@ import (
 	"path"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,6 +28,7 @@ import (
 	v2 "github.com/distribution/distribution/v3/registry/api/v2"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/filesystem"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/distribution/distribution/v3/testutil"
 	"github.com/distribution/reference"
@@ -34,6 +36,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	hookstest "github.com/sirupsen/logrus/hooks/test"
 )
 
 var headerConfig = http.Header{
@@ -545,6 +548,12 @@ func TestTagsAPI(t *testing.T) {
 			}},
 		},
 		{
+			name:               "page after last tag",
+			queryParams:        url.Values{"last": []string{"sb71y"}, "n": []string{"1"}},
+			expectedStatusCode: http.StatusOK,
+			expectedBody:       tagsAPIResponse{Name: imageName.Name(), Tags: []string{}},
+		},
+		{
 			name:               "page size bigger than full list",
 			queryParams:        url.Values{"n": []string{"100"}},
 			expectedStatusCode: http.StatusOK,
@@ -564,9 +573,11 @@ func TestTagsAPI(t *testing.T) {
 			queryParams:        url.Values{"last": []string{"does-not-exist"}, "n": []string{"3"}},
 			expectedStatusCode: http.StatusOK,
 			expectedBody: tagsAPIResponse{Name: imageName.Name(), Tags: []string{
+				"jyi7b",
 				"kb0j5",
 				"sb71y",
 			}},
+			expectedLinkHeader: `</v2/test/tags/list?last=sb71y&n=3>; rel="next"`,
 		},
 	}
 
@@ -597,7 +608,7 @@ func TestTagsAPI(t *testing.T) {
 					t.Fatalf("unexpected error decoding response body: %v", err)
 				}
 				if !reflect.DeepEqual(body, test.expectedBody) {
-					t.Fatalf("expected response body to be:\n%+v\ngot:\n%+v", test.expectedBody, body)
+					t.Fatalf("expected response body to be:\n%#v\ngot:\n%#v", test.expectedBody, body)
 				}
 			}
 
@@ -605,6 +616,63 @@ func TestTagsAPI(t *testing.T) {
 				t.Fatalf("expected response Link header to be %q, got %q", test.expectedLinkHeader, resp.Header.Get("Link"))
 			}
 		})
+	}
+}
+
+// TestTagsAPIMaxTagsClamp verifies that the tags/list endpoint clamps an n
+// query parameter greater than the server's configured MaxTags down to MaxTags
+// rather than returning 400 — the OCI distribution-spec permits a server to
+// return fewer than n results when a Link header is provided.
+func TestTagsAPIMaxTagsClamp(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"inmemory":    configuration.Parameters{},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{"enabled": false}},
+		},
+		Catalog: configuration.Catalog{MaxEntries: 5},
+		Tags:    configuration.Tags{MaxTags: 2},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+
+	imageName, err := reference.WithName("test")
+	if err != nil {
+		t.Fatalf("unable to parse reference: %v", err)
+	}
+
+	tags := []string{"2j2ar", "asj9e", "jyi7b", "kb0j5", "sb71y"}
+	for _, tag := range tags {
+		createRepository(env, t, imageName.Name(), tag)
+	}
+
+	tagsURL, err := env.builder.BuildTagsURL(imageName, url.Values{"n": []string{"100"}})
+	if err != nil {
+		t.Fatalf("unexpected error building tags URL: %v", err)
+	}
+
+	resp, err := http.Get(tagsURL)
+	if err != nil {
+		t.Fatalf("unexpected error issuing request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected response status code to be %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	var body tagsAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("unexpected error decoding response body: %v", err)
+	}
+	expected := tagsAPIResponse{Name: imageName.Name(), Tags: []string{"2j2ar", "asj9e"}}
+	if !reflect.DeepEqual(body, expected) {
+		t.Fatalf("expected response body to be:\n%+v\ngot:\n%+v", expected, body)
+	}
+
+	wantLink := `</v2/test/tags/list?last=asj9e&n=2>; rel="next"`
+	if got := resp.Header.Get("Link"); got != wantLink {
+		t.Fatalf("expected response Link header to be %q, got %q", wantLink, got)
 	}
 }
 
@@ -630,19 +698,14 @@ func checkLink(t *testing.T, urlStr string, numEntries int, last string) url.Val
 }
 
 func contains(elems []string, e string) bool {
-	for _, elem := range elems {
-		if elem == e {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(elems, e)
 }
 
 func TestURLPrefix(t *testing.T) {
 	config := configuration.Configuration{
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
@@ -711,6 +774,21 @@ func TestBlobAPI(t *testing.T) {
 	testBlobAPI(t, env2, args)
 }
 
+func TestBlobAPIFilesystem(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"filesystem": configuration.Parameters{"rootdirectory": t.TempDir()},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
+				"enabled": false,
+			}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+	testBlobAPI(t, env, makeBlobArgs(t))
+}
+
 func TestBlobDelete(t *testing.T) {
 	deleteEnabled := true
 	env := newTestEnv(t, deleteEnabled)
@@ -725,7 +803,7 @@ func TestRelativeURL(t *testing.T) {
 	config := configuration.Configuration{
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
@@ -1305,7 +1383,7 @@ func TestManifestAPI(t *testing.T) {
 }
 
 func TestManifestAPI_DeleteTag(t *testing.T) {
-	env := newTestEnv(t, false)
+	env := newTestEnv(t, true)
 	defer env.Shutdown()
 
 	imageName, err := reference.WithName("foo/bar")
@@ -1350,7 +1428,7 @@ func TestManifestAPI_DeleteTag(t *testing.T) {
 }
 
 func TestManifestAPI_DeleteTag_Unknown(t *testing.T) {
-	env := newTestEnv(t, false)
+	env := newTestEnv(t, true)
 	defer env.Shutdown()
 
 	imageName, err := reference.WithName("foo/bar")
@@ -1394,6 +1472,76 @@ func TestManifestAPI_DeleteTag_ReadOnly(t *testing.T) {
 	checkResponse(t, msg, resp, http.StatusMethodNotAllowed)
 }
 
+func TestManifestAPI_DeleteTag_DeleteDisabled(t *testing.T) {
+	env := newTestEnv(t, false)
+	defer env.Shutdown()
+
+	imageName, err := reference.WithName("foo/bar")
+	checkErr(t, err, "building named object")
+
+	tag := "latest"
+	createRepository(env, t, imageName.Name(), tag)
+
+	ref, err := reference.WithTag(imageName, tag)
+	checkErr(t, err, "building tag reference")
+
+	u, err := env.builder.BuildManifestURL(ref)
+	checkErr(t, err, "building tag URL")
+
+	resp, err := httpDelete(u)
+	msg := "deleting tag with delete disabled"
+	checkErr(t, err, msg)
+	defer resp.Body.Close()
+
+	checkResponse(t, msg, resp, http.StatusMethodNotAllowed)
+	// nolint:errcheck
+	checkBodyHasErrorCodes(t, msg, resp, errcode.ErrorCodeUnsupported)
+
+	msg = "checking tag exists after rejected delete"
+	resp, err = http.Get(u)
+	checkErr(t, err, msg)
+	defer resp.Body.Close()
+	checkResponse(t, msg, resp, http.StatusOK)
+}
+
+func TestManifestAPI_NameTooLong(t *testing.T) {
+	config := configuration.Configuration{
+		Storage: configuration.Storage{
+			"inmemory":    configuration.Parameters{},
+			"cache":       configuration.Parameters{"blobdescriptor": "inmemory"},
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{"enabled": false}},
+		},
+	}
+	config.HTTP.Headers = headerConfig
+	env := newTestEnvWithConfig(t, &config)
+	defer env.Shutdown()
+
+	// "foo" is a domain to WithName but part of the path (docker.io/foo/...) to the cache.
+	for _, tc := range []struct {
+		name string
+		repo string
+	}{
+		{
+			name: "rejected by reference.WithName",
+			repo: "foo/" + strings.Repeat("a", reference.RepositoryNameTotalLengthMax+1),
+		},
+		{
+			name: "rejected by the blob descriptor cache",
+			repo: "foo/" + strings.Repeat("a", reference.RepositoryNameTotalLengthMax),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Get(env.server.URL + "/v2/" + tc.repo + "/manifests/latest")
+			checkErr(t, err, tc.name)
+			defer resp.Body.Close()
+
+			checkResponse(t, tc.name, resp, http.StatusBadRequest)
+			// nolint:errcheck
+			checkBodyHasErrorCodes(t, tc.name, resp, errcode.ErrorCodeNameInvalid)
+		})
+	}
+}
+
 // storageManifestErrDriverFactory implements the factory.StorageDriverFactory interface.
 type storageManifestErrDriverFactory struct{}
 
@@ -1404,7 +1552,7 @@ const (
 	repositoryWithGenericStorageError = "genericstorageerr"
 )
 
-func (factory *storageManifestErrDriverFactory) Create(ctx context.Context, parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
+func (factory *storageManifestErrDriverFactory) Create(ctx context.Context, parameters map[string]any) (storagedriver.StorageDriver, error) {
 	// Initialize the mock driver
 	errGenericStorage := errors.New("generic storage error")
 	return &mockErrorDriver{
@@ -1459,7 +1607,7 @@ func TestGetManifestWithStorageError(t *testing.T) {
 	config := configuration.Configuration{
 		Storage: configuration.Storage{
 			"storagemanifesterror": configuration.Parameters{},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
@@ -1709,7 +1857,10 @@ func testManifestAPISchema2(t *testing.T, env *testEnv, imageName reference.Name
 	// ------------------
 	// Fetch by tag name
 
-	// HEAD requests should not contain a body
+	// HEAD requests should emit a logging entry and not contain a body
+	hook := hookstest.NewGlobal()
+	defer hook.Reset()
+
 	headReq, err := http.NewRequest(http.MethodHead, manifestURL, nil)
 	if err != nil {
 		t.Fatalf("Error constructing request: %s", err)
@@ -1725,6 +1876,14 @@ func testManifestAPISchema2(t *testing.T, env *testEnv, imageName reference.Name
 		"Docker-Content-Digest": []string{dgst.String()},
 		"ETag":                  []string{fmt.Sprintf(`"%s"`, dgst)},
 	})
+
+	lastMsg := hook.LastEntry()
+	if v := lastMsg.Data["http.request.method"]; v != http.MethodHead {
+		t.Errorf("expected http.request.method to be %q, got %q", http.MethodHead, v)
+	}
+	if v := lastMsg.Data["http.response.status"]; v != http.StatusOK {
+		t.Errorf("expected http.response.status to be %d, got %d", http.StatusOK, v)
+	}
 
 	headBody, err := io.ReadAll(headResp.Body)
 	if err != nil {
@@ -2219,7 +2378,7 @@ func newTestEnvMirror(t *testing.T, deleteEnabled bool) *testEnv {
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
 			"delete":   configuration.Parameters{"enabled": deleteEnabled},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
@@ -2239,12 +2398,15 @@ func newTestEnv(t *testing.T, deleteEnabled bool) *testEnv {
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
 			"delete":   configuration.Parameters{"enabled": deleteEnabled},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
 		Catalog: configuration.Catalog{
 			MaxEntries: 5,
+		},
+		Tags: configuration.Tags{
+			MaxTags: 1000,
 		},
 	}
 
@@ -2277,7 +2439,7 @@ func (t *testEnv) Shutdown() {
 	t.server.Close()
 }
 
-func putManifest(t *testing.T, msg, url, contentType string, v interface{}) *http.Response {
+func putManifest(t *testing.T, msg, url, contentType string, v any) *http.Response {
 	var body []byte
 
 	switch m := v.(type) {
@@ -2793,7 +2955,7 @@ func TestProxyManifestGetByTag(t *testing.T) {
 	truthConfig := configuration.Configuration{
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},

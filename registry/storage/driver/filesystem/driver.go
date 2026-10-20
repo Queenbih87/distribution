@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"time"
 
 	"github.com/distribution/distribution/v3/internal/uuid"
@@ -43,7 +44,7 @@ func init() {
 // filesystemDriverFactory implements the factory.StorageDriverFactory interface
 type filesystemDriverFactory struct{}
 
-func (factory *filesystemDriverFactory) Create(ctx context.Context, parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
+func (factory *filesystemDriverFactory) Create(ctx context.Context, parameters map[string]any) (storagedriver.StorageDriver, error) {
 	return FromParameters(parameters)
 }
 
@@ -65,7 +66,7 @@ type Driver struct {
 // Optional Parameters:
 // - rootdirectory
 // - maxthreads
-func FromParameters(parameters map[string]interface{}) (*Driver, error) {
+func FromParameters(parameters map[string]any) (*Driver, error) {
 	params, err := fromParametersImpl(parameters)
 	if err != nil || params == nil {
 		return nil, err
@@ -73,7 +74,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	return New(*params), nil
 }
 
-func fromParametersImpl(parameters map[string]interface{}) (*DriverParameters, error) {
+func fromParametersImpl(parameters map[string]any) (*DriverParameters, error) {
 	var (
 		err           error
 		maxThreads    = defaultMaxThreads
@@ -158,14 +159,18 @@ func (d *driver) PutContent(ctx context.Context, subPath string, contents []byte
 		return err
 	}
 
+	// Close the file before renaming it, which is required on Windows.
+	if err := writer.Close(); err != nil {
+		return errors.Join(err, d.Delete(ctx, tempPath))
+	}
+
 	// Atomically replace the target file with the temporary file.
 	if err := d.Move(ctx, tempPath, subPath); err != nil {
 		// Clean up the temporary file if rename fails.
 		dErr := d.Delete(ctx, tempPath)
 		return errors.Join(err, dErr)
 	}
-
-	return nil
+	return syncDir(filepath.Dir(d.fullPath(subPath)))
 }
 
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
@@ -174,7 +179,7 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	file, err := os.OpenFile(d.fullPath(path), os.O_RDONLY, 0o644)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, storagedriver.PathNotFoundError{Path: path}
+			return nil, storagedriver.PathNotFoundError{Path: path, RootDirectory: d.rootDirectory}
 		}
 
 		return nil, err
@@ -194,7 +199,7 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 
 func (d *driver) Writer(ctx context.Context, subPath string, append bool) (storagedriver.FileWriter, error) {
 	fullPath := d.fullPath(subPath)
-	parentDir := path.Dir(fullPath)
+	parentDir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(parentDir, 0o777); err != nil {
 		return nil, err
 	}
@@ -232,7 +237,7 @@ func (d *driver) Stat(ctx context.Context, subPath string) (storagedriver.FileIn
 	fi, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, storagedriver.PathNotFoundError{Path: subPath}
+			return nil, storagedriver.PathNotFoundError{Path: subPath, RootDirectory: d.rootDirectory}
 		}
 
 		return nil, err
@@ -252,7 +257,7 @@ func (d *driver) List(ctx context.Context, subPath string) ([]string, error) {
 	dir, err := os.Open(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, storagedriver.PathNotFoundError{Path: subPath}
+			return nil, storagedriver.PathNotFoundError{Path: subPath, RootDirectory: d.rootDirectory}
 		}
 		return nil, err
 	}
@@ -279,10 +284,10 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 	dest := d.fullPath(destPath)
 
 	if _, err := os.Stat(source); os.IsNotExist(err) {
-		return storagedriver.PathNotFoundError{Path: sourcePath}
+		return storagedriver.PathNotFoundError{Path: sourcePath, RootDirectory: d.rootDirectory}
 	}
 
-	if err := os.MkdirAll(path.Dir(dest), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o777); err != nil {
 		return err
 	}
 
@@ -298,7 +303,7 @@ func (d *driver) Delete(ctx context.Context, subPath string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	} else if err != nil {
-		return storagedriver.PathNotFoundError{Path: subPath}
+		return storagedriver.PathNotFoundError{Path: subPath, RootDirectory: d.rootDirectory}
 	}
 
 	err = os.RemoveAll(fullPath)
@@ -318,7 +323,7 @@ func (d *driver) Walk(ctx context.Context, path string, f storagedriver.WalkFn, 
 
 // fullPath returns the absolute path of a key within the Driver's storage.
 func (d *driver) fullPath(subPath string) string {
-	return path.Join(d.rootDirectory, subPath)
+	return filepath.Join(d.rootDirectory, subPath)
 }
 
 type fileInfo struct {
@@ -389,24 +394,27 @@ func (fw *fileWriter) Size() int64 {
 	return fw.size
 }
 
-func (fw *fileWriter) Close() error {
+func (fw *fileWriter) Close() (retErr error) {
 	if fw.closed {
 		return fmt.Errorf("already closed")
+	}
+	fw.closed = true
+	defer func() {
+		if err := fw.file.Close(); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+
+	if fw.committed {
+		// Already flushed and synced
+		return nil
 	}
 
 	if err := fw.bw.Flush(); err != nil {
 		return err
 	}
 
-	if err := fw.file.Sync(); err != nil {
-		return err
-	}
-
-	if err := fw.file.Close(); err != nil {
-		return err
-	}
-	fw.closed = true
-	return nil
+	return fw.file.Sync()
 }
 
 func (fw *fileWriter) Cancel(ctx context.Context) error {
@@ -415,7 +423,8 @@ func (fw *fileWriter) Cancel(ctx context.Context) error {
 	}
 
 	fw.cancelled = true
-	fw.file.Close()
+	fw.closed = true
+	_ = fw.file.Close()
 	return os.Remove(fw.file.Name())
 }
 

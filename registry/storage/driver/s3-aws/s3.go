@@ -20,7 +20,8 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"path/filepath"
+	"net/url"
+	"path"
 	"slices"
 	"sort"
 	"strconv"
@@ -82,6 +83,7 @@ var s3StorageClasses = []string{
 	s3.StorageClassIntelligentTiering,
 	s3.StorageClassOutposts,
 	s3.StorageClassGlacierIr,
+	s3.StorageClassExpressOnezone,
 }
 
 // validRegions maps known s3 region identifiers to region descriptors
@@ -114,7 +116,9 @@ type DriverParameters struct {
 	SessionToken                string
 	UseDualStack                bool
 	Accelerate                  bool
+	UseFIPSEndpoint             bool
 	LogLevel                    aws.LogLevelType
+	RedirectEndpoint            string
 }
 
 func init() {
@@ -145,7 +149,7 @@ func init() {
 // s3DriverFactory implements the factory.StorageDriverFactory interface
 type s3DriverFactory struct{}
 
-func (factory *s3DriverFactory) Create(ctx context.Context, parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
+func (factory *s3DriverFactory) Create(ctx context.Context, parameters map[string]any) (storagedriver.StorageDriver, error) {
 	return FromParameters(ctx, parameters)
 }
 
@@ -163,6 +167,7 @@ type driver struct {
 	RootDirectory               string
 	StorageClass                string
 	ObjectACL                   string
+	RedirectEndpoint            *url.URL
 	pool                        *sync.Pool
 }
 
@@ -183,7 +188,7 @@ type Driver struct {
 // - region
 // - bucket
 // - encrypt
-func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Driver, error) {
+func FromParameters(ctx context.Context, parameters map[string]any) (*Driver, error) {
 	// Providing no values for these is valid in case the user is authenticating
 	// with an IAM on an ec2 instance (in which case the instance credentials will
 	// be summoned when GetAuth is called)
@@ -201,21 +206,9 @@ func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Dr
 		regionEndpoint = ""
 	}
 
-	forcePathStyleBool := false
-	forcePathStyle := parameters["forcepathstyle"]
-	switch forcePathStyle := forcePathStyle.(type) {
-	case string:
-		b, err := strconv.ParseBool(forcePathStyle)
-		if err != nil {
-			return nil, fmt.Errorf("the forcePathStyle parameter should be a boolean")
-		}
-		forcePathStyleBool = b
-	case bool:
-		forcePathStyleBool = forcePathStyle
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the forcePathStyle parameter should be a boolean")
+	forcePathStyleBool, err := getParameterAsBool(parameters, "forcepathstyle", false)
+	if err != nil {
+		return nil, err
 	}
 
 	regionName := parameters["region"]
@@ -236,72 +229,24 @@ func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Dr
 		return nil, fmt.Errorf("no bucket parameter provided")
 	}
 
-	encryptBool := false
-	encrypt := parameters["encrypt"]
-	switch encrypt := encrypt.(type) {
-	case string:
-		b, err := strconv.ParseBool(encrypt)
-		if err != nil {
-			return nil, fmt.Errorf("the encrypt parameter should be a boolean")
-		}
-		encryptBool = b
-	case bool:
-		encryptBool = encrypt
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the encrypt parameter should be a boolean")
+	encryptBool, err := getParameterAsBool(parameters, "encrypt", false)
+	if err != nil {
+		return nil, err
 	}
 
-	secureBool := true
-	secure := parameters["secure"]
-	switch secure := secure.(type) {
-	case string:
-		b, err := strconv.ParseBool(secure)
-		if err != nil {
-			return nil, fmt.Errorf("the secure parameter should be a boolean")
-		}
-		secureBool = b
-	case bool:
-		secureBool = secure
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the secure parameter should be a boolean")
+	secureBool, err := getParameterAsBool(parameters, "secure", true)
+	if err != nil {
+		return nil, err
 	}
 
-	skipVerifyBool := false
-	skipVerify := parameters["skipverify"]
-	switch skipVerify := skipVerify.(type) {
-	case string:
-		b, err := strconv.ParseBool(skipVerify)
-		if err != nil {
-			return nil, fmt.Errorf("the skipVerify parameter should be a boolean")
-		}
-		skipVerifyBool = b
-	case bool:
-		skipVerifyBool = skipVerify
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the skipVerify parameter should be a boolean")
+	skipVerifyBool, err := getParameterAsBool(parameters, "skipverify", false)
+	if err != nil {
+		return nil, err
 	}
 
-	v4Bool := true
-	v4auth := parameters["v4auth"]
-	switch v4auth := v4auth.(type) {
-	case string:
-		b, err := strconv.ParseBool(v4auth)
-		if err != nil {
-			return nil, fmt.Errorf("the v4auth parameter should be a boolean")
-		}
-		v4Bool = b
-	case bool:
-		v4Bool = v4auth
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the v4auth parameter should be a boolean")
+	v4Bool, err := getParameterAsBool(parameters, "v4auth", true)
+	if err != nil {
+		return nil, err
 	}
 
 	keyID := parameters["keyid"]
@@ -347,14 +292,7 @@ func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Dr
 		}
 		// All valid storage class parameters are UPPERCASE, so be a bit more flexible here
 		storageClassString = strings.ToUpper(storageClassString)
-		if storageClassString != noStorageClass &&
-			storageClassString != s3.StorageClassStandard &&
-			storageClassString != s3.StorageClassReducedRedundancy &&
-			storageClassString != s3.StorageClassStandardIa &&
-			storageClassString != s3.StorageClassOnezoneIa &&
-			storageClassString != s3.StorageClassIntelligentTiering &&
-			storageClassString != s3.StorageClassOutposts &&
-			storageClassString != s3.StorageClassGlacierIr {
+		if !slices.Contains(s3StorageClasses, storageClassString) {
 			return nil, fmt.Errorf(
 				"the storageclass parameter must be one of %v, %v invalid",
 				s3StorageClasses,
@@ -383,40 +321,26 @@ func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Dr
 		objectACL = objectACLString
 	}
 
-	useDualStackBool := false
-	useDualStack := parameters["usedualstack"]
-	switch useDualStack := useDualStack.(type) {
-	case string:
-		b, err := strconv.ParseBool(useDualStack)
-		if err != nil {
-			return nil, fmt.Errorf("the useDualStack parameter should be a boolean")
-		}
-		useDualStackBool = b
-	case bool:
-		useDualStackBool = useDualStack
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the useDualStack parameter should be a boolean")
+	useDualStackBool, err := getParameterAsBool(parameters, "usedualstack", false)
+	if err != nil {
+		return nil, err
 	}
 
 	sessionToken := ""
 
-	accelerateBool := false
-	accelerate := parameters["accelerate"]
-	switch accelerate := accelerate.(type) {
-	case string:
-		b, err := strconv.ParseBool(accelerate)
-		if err != nil {
-			return nil, fmt.Errorf("the accelerate parameter should be a boolean")
-		}
-		accelerateBool = b
-	case bool:
-		accelerateBool = accelerate
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the accelerate parameter should be a boolean")
+	accelerateBool, err := getParameterAsBool(parameters, "accelerate", false)
+	if err != nil {
+		return nil, err
+	}
+
+	useFIPSEndpointBool, err := getParameterAsBool(parameters, "usefipsendpoint", false)
+	if err != nil {
+		return nil, err
+	}
+
+	redirectEndpoint := parameters["redirectendpoint"]
+	if redirectEndpoint == nil {
+		redirectEndpoint = ""
 	}
 
 	params := DriverParameters{
@@ -442,7 +366,9 @@ func FromParameters(ctx context.Context, parameters map[string]interface{}) (*Dr
 		SessionToken:                fmt.Sprint(sessionToken),
 		UseDualStack:                useDualStackBool,
 		Accelerate:                  accelerateBool,
+		UseFIPSEndpoint:             useFIPSEndpointBool,
 		LogLevel:                    getS3LogLevelFromParam(parameters["loglevel"]),
+		RedirectEndpoint:            fmt.Sprint(redirectEndpoint),
 	}
 
 	return New(ctx, params)
@@ -509,6 +435,26 @@ func getParameterAsInteger[T integer](parameters map[string]any, name string, de
 	return v, nil
 }
 
+// getParameterAsBool converts parameters[name] to a boolean (using defaultValue if
+// nil). It accepts both string and bool types.
+func getParameterAsBool(parameters map[string]any, name string, defaultValue bool) (bool, error) {
+	if p := parameters[name]; p != nil {
+		switch v := p.(type) {
+		case string:
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return false, fmt.Errorf("the %s parameter should be a boolean", name)
+			}
+			return b, nil
+		case bool:
+			return v, nil
+		default:
+			return false, fmt.Errorf("the %s parameter should be a boolean", name)
+		}
+	}
+	return defaultValue, nil
+}
+
 // New constructs a new Driver with the given AWS credentials, region, encryption flag, and
 // bucketName
 func New(ctx context.Context, params DriverParameters) (*Driver, error) {
@@ -539,6 +485,9 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 	awsConfig.WithDisableSSL(!params.Secure)
 	if params.UseDualStack {
 		awsConfig.UseDualStackEndpoint = endpoints.DualStackEndpointStateEnabled
+	}
+	if params.UseFIPSEndpoint {
+		awsConfig.UseFIPSEndpoint = endpoints.FIPSEndpointStateEnabled
 	}
 
 	if params.SkipVerify {
@@ -595,6 +544,29 @@ func New(ctx context.Context, params DriverParameters) (*Driver, error) {
 		pool: &sync.Pool{
 			New: func() any { return &bytes.Buffer{} },
 		},
+	}
+
+	if params.RedirectEndpoint != "" {
+		u, err := url.Parse(params.RedirectEndpoint)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse redirectendpoint: %w", err)
+		}
+		if u.Scheme == "" {
+			return nil, fmt.Errorf("no scheme specified for redirectendpoint")
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("no host specified for redirectendpoint")
+		}
+		// Edge Case: Reject trailing paths (e.g., /cdn/v1) because the hot path ignores them
+		if u.Path != "" && u.Path != "/" {
+			return nil, fmt.Errorf("redirectendpoint cannot contain a base path: %s", u.Path)
+		}
+		// Edge Case: Reject query parameters because they break AWS SigV4 signatures
+		if u.RawQuery != "" {
+			return nil, fmt.Errorf("redirectendpoint cannot contain query parameters")
+		}
+
+		d.RedirectEndpoint = u
 	}
 
 	return &Driver{
@@ -1013,11 +985,13 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 	for {
 		// list all the objects
 		resp, err := d.S3.ListObjectsV2WithContext(ctx, listObjectsInput)
-
+		if err != nil {
+			return err
+		}
 		// resp.Contents can only be empty on the first call
 		// if there were no more results to return after the first call, resp.IsTruncated would have been false
 		// and the loop would exit without recalling ListObjects
-		if err != nil || len(resp.Contents) == 0 {
+		if len(resp.Contents) == 0 {
 			return storagedriver.PathNotFoundError{Path: path}
 		}
 
@@ -1097,6 +1071,13 @@ func (d *driver) RedirectURL(r *http.Request, path string) (string, error) {
 		})
 	default:
 		return "", nil
+	}
+
+	// If a public redirect endpoint is configured, use it for the signed URL
+	// This allows using a different public endpoint for downloads with signed URLs
+	if d.RedirectEndpoint != nil && req.HTTPRequest != nil {
+		req.HTTPRequest.URL.Host = d.RedirectEndpoint.Host
+		req.HTTPRequest.URL.Scheme = d.RedirectEndpoint.Scheme
 	}
 
 	return req.Presign(expiresIn)
@@ -1197,7 +1178,7 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from, sta
 
 		for _, walkInfo := range walkInfos {
 			// skip any results under the last skip directory
-			if prevSkipDir != "" && strings.HasPrefix(walkInfo.Path(), prevSkipDir) {
+			if isSubpath(walkInfo.Path(), prevSkipDir) {
 				continue
 			}
 
@@ -1249,6 +1230,11 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, from, sta
 //
 //	directoryDiff("/", "/path/to/folder/folder/file")
 //	// => [ "/path", "/path/to", "/path/to/folder", "/path/to/folder/folder" ]
+//
+// prev and current are S3 object keys, which always use "/" as a separator
+// regardless of host OS, so this must use path.Dir rather than filepath.Dir:
+// on Windows, filepath.Dir converges to "\" instead of "/", so the loop's
+// "/" exit condition never fires and it never terminates.
 func directoryDiff(prev, current string) []string {
 	var paths []string
 
@@ -1258,7 +1244,7 @@ func directoryDiff(prev, current string) []string {
 
 	parent := current
 	for {
-		parent = filepath.Dir(parent)
+		parent = path.Dir(parent)
 		if parent == "/" || parent == prev || strings.HasPrefix(prev+"/", parent+"/") {
 			break
 		}
@@ -1266,6 +1252,19 @@ func directoryDiff(prev, current string) []string {
 	}
 	slices.Reverse(paths)
 	return paths
+}
+
+func isSubpath(path, parent string) bool {
+	if parent == "" {
+		return false
+	}
+	if path == parent {
+		return true
+	}
+	if parent == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	return strings.HasPrefix(path, parent+"/")
 }
 
 func (d *driver) s3Path(path string) string {

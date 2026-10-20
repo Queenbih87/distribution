@@ -42,7 +42,7 @@ const (
 
 type azureDriverFactory struct{}
 
-func (factory *azureDriverFactory) Create(ctx context.Context, parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
+func (factory *azureDriverFactory) Create(ctx context.Context, parameters map[string]any) (storagedriver.StorageDriver, error) {
 	params, err := NewParameters(parameters)
 	if err != nil {
 		return nil, err
@@ -119,59 +119,65 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	// TODO(milosgajdos): this check is not needed as UploadBuffer will return error if we exceed the max blockbytes limit
 	// max size for block blobs uploaded via single "Put Blob" for version after "2016-05-31"
 	// https://docs.microsoft.com/en-us/rest/api/storageservices/put-blob#remarks
 	if len(contents) > blockblob.MaxUploadBlobBytes {
 		return fmt.Errorf("content size exceeds max allowed limit (%d): %d", blockblob.MaxUploadBlobBytes, len(contents))
 	}
 
-	// Historically, blobs uploaded via PutContent used to be of type AppendBlob
-	// (https://github.com/distribution/distribution/pull/1438). We can't replace
-	// these blobs atomically via a single "Put Blob" operation without
-	// deleting them first. Once we detect they are BlockBlob type, we can
-	// overwrite them with an atomically "Put Blob" operation.
-	//
-	// While we delete the blob and create a new one, there will be a small
-	// window of inconsistency and if the Put Blob fails, we may end up with
-	// losing the existing data while migrating it to BlockBlob type. However,
-	// expectation is the clients pushing will be retrying when they get an error
-	// response.
 	blobName := d.blobName(path)
+
+	// Azure cannot atomically replace an existing AppendBlob with a BlockBlob.
+	// Delete the old PutContent representation before the block-blob upload.
+	if err := d.deleteLegacyPutContentBlob(ctx, blobName); err != nil {
+		return err
+	}
+
+	if err := d.uploadBlockBlob(ctx, blobName, contents); err != nil {
+		return fmt.Errorf("failed to upload block blob: %w", err)
+	}
+
+	return nil
+}
+
+func (d *driver) uploadBlockBlob(ctx context.Context, blobName string, contents []byte) error {
+	blockBlobRef := d.client.NewBlockBlobClient(blobName)
+	_, err := blockBlobRef.Upload(ctx, streaming.NopCloser(bytes.NewReader(contents)), nil)
+	return err
+}
+
+func (d *driver) deleteLegacyPutContentBlob(ctx context.Context, blobName string) error {
 	blobRef := d.client.NewBlobClient(blobName)
 	props, err := blobRef.GetProperties(ctx, nil)
-	if err != nil && !is404(err) {
+	if err != nil {
+		if is404(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to get blob properties: %v", err)
 	}
-	if err == nil && props.BlobType != nil && *props.BlobType != blob.BlobTypeBlockBlob {
-		if _, err := blobRef.Delete(ctx, nil); err != nil {
-			return fmt.Errorf("failed to delete legacy blob (%v): %v", *props.BlobType, err)
-		}
+
+	if props.BlobType == nil {
+		return fmt.Errorf("missing BlobType: %s", blobName)
+	}
+	if *props.BlobType == blob.BlobTypeBlockBlob {
+		return nil
+	}
+	if props.ETag == nil {
+		return fmt.Errorf("missing ETag for legacy blob: %s", blobName)
 	}
 
-	// Always create as AppendBlob
-	appendBlobRef := d.client.NewAppendBlobClient(blobName)
-	if _, err := appendBlobRef.Create(ctx, nil); err != nil {
-		return fmt.Errorf("failed to create append blob: %v", err)
-	}
-
-	// If we have content, append it
-	if len(contents) > 0 {
-		// Write in chunks of maxChunkSize otherwise Azure can barf
-		// when writing large piece of data in one sot:
-		// RESPONSE 413: 413 The uploaded entity blob is too large.
-		for offset := 0; offset < len(contents); offset += maxChunkSize {
-			end := offset + maxChunkSize
-			if end > len(contents) {
-				end = len(contents)
-			}
-
-			chunk := contents[offset:end]
-			_, err := appendBlobRef.AppendBlock(ctx, streaming.NopCloser(bytes.NewReader(chunk)), nil)
-			if err != nil {
-				return fmt.Errorf("failed to append content: %v", err)
-			}
+	_, err = blobRef.Delete(ctx, &blob.DeleteOptions{
+		AccessConditions: &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+				IfMatch: props.ETag,
+			},
+		},
+	})
+	if err != nil {
+		if is404(err) || bloberror.HasCode(err, bloberror.ConditionNotMet) {
+			return nil
 		}
+		return fmt.Errorf("failed to delete legacy blob (%v): %v", *props.BlobType, err)
 	}
 
 	return nil
@@ -234,7 +240,32 @@ func (d *driver) Writer(ctx context.Context, path string, appendMode bool) (stor
 			if props.ContentLength == nil {
 				return nil, fmt.Errorf("missing ContentLength: %s", blobName)
 			}
+			if props.BlobType == nil {
+				return nil, fmt.Errorf("missing BlobType: %s", blobName)
+			}
+
 			size = *props.ContentLength
+			if *props.BlobType == blob.BlobTypeBlockBlob && size == 0 {
+				if props.ETag == nil {
+					return nil, fmt.Errorf("missing ETag for zero-length block blob: %s", blobName)
+				}
+				if _, err := blobRef.Delete(ctx, &blob.DeleteOptions{
+					AccessConditions: &blob.AccessConditions{
+						ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+							IfMatch: props.ETag,
+						},
+					},
+				}); err != nil && !is404(err) {
+					return nil, fmt.Errorf("deleting zero-length block blob before append: %w", err)
+				}
+				res, err := d.client.NewAppendBlobClient(blobName).Create(ctx, nil)
+				if err != nil {
+					return nil, fmt.Errorf("creating new append blob: %w", err)
+				}
+				eTag = res.ETag
+			} else if *props.BlobType != blob.BlobTypeAppendBlob {
+				return nil, fmt.Errorf("cannot append to existing %s blob: %s", *props.BlobType, blobName)
+			}
 		} else {
 			if _, err := blobRef.Delete(ctx, nil); err != nil && !is404(err) {
 				return nil, fmt.Errorf("deleting existing blob before write: %w", err)
@@ -661,7 +692,7 @@ func (bw *blockWriter) Write(p []byte) (int, error) {
 		}
 		appendposFailed := bloberror.HasCode(err, bloberror.AppendPositionConditionNotMet)
 		etagFailed := bloberror.HasCode(err, bloberror.ConditionNotMet)
-		if !(appendposFailed || etagFailed) || !timeoutFromCtx {
+		if (!appendposFailed && !etagFailed) || !timeoutFromCtx {
 			// Error was not caused by an operation timeout, abort!
 			return n, fmt.Errorf("appending blob: %w", err)
 		}

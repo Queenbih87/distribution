@@ -1295,6 +1295,42 @@ func (m *Cluster) MarshalToSizedBufferVTStrict(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.TransportSocketMatcher != nil {
+		if vtmsg, ok := interface{}(m.TransportSocketMatcher).(interface {
+			MarshalToSizedBufferVTStrict([]byte) (int, error)
+		}); ok {
+			size, err := vtmsg.MarshalToSizedBufferVTStrict(dAtA[:i])
+			if err != nil {
+				return 0, err
+			}
+			i -= size
+			i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+		} else {
+			encoded, err := proto.Marshal(m.TransportSocketMatcher)
+			if err != nil {
+				return 0, err
+			}
+			i -= len(encoded)
+			copy(dAtA[i:], encoded)
+			i = protohelpers.EncodeVarint(dAtA, i, uint64(len(encoded)))
+		}
+		i--
+		dAtA[i] = 0x3
+		i--
+		dAtA[i] = 0xda
+	}
+	if m.DnsJitter != nil {
+		size, err := (*durationpb.Duration)(m.DnsJitter).MarshalToSizedBufferVTStrict(dAtA[:i])
+		if err != nil {
+			return 0, err
+		}
+		i -= size
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
+		i--
+		dAtA[i] = 0x3
+		i--
+		dAtA[i] = 0xd2
+	}
 	if len(m.LrsReportEndpointMetrics) > 0 {
 		for iNdEx := len(m.LrsReportEndpointMetrics) - 1; iNdEx >= 0; iNdEx-- {
 			i -= len(m.LrsReportEndpointMetrics[iNdEx])
@@ -3241,6 +3277,20 @@ func (m *Cluster) SizeVT() (n int) {
 			l = len(s)
 			n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
 		}
+	}
+	if m.DnsJitter != nil {
+		l = (*durationpb.Duration)(m.DnsJitter).SizeVT()
+		n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
+	}
+	if m.TransportSocketMatcher != nil {
+		if size, ok := interface{}(m.TransportSocketMatcher).(interface {
+			SizeVT() int
+		}); ok {
+			l = size.SizeVT()
+		} else {
+			l = proto.Size(m.TransportSocketMatcher)
+		}
+		n += 2 + l + protohelpers.SizeOfVarint(uint64(l))
 	}
 	n += len(m.unknownFields)
 	return n

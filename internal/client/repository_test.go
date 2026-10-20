@@ -346,6 +346,74 @@ func TestBlobFetch(t *testing.T) {
 	// TODO(dmcgowan): Test for unknown blob case
 }
 
+// TestBlobFetchByDigestVerifies ensures that a blob requested by digest via Get
+// is rejected when the registry returns content that does not hash to the
+// requested digest. Regression test for GHSA-685w-q87j-wqw3 (blob path).
+//
+// Get is the integrity-providing API: it buffers and verifies the whole blob.
+// Open streams and is intentionally not verified (a content digest cannot be
+// checked without reading the entire content, which Open does not require).
+func TestBlobFetchByDigestVerifies(t *testing.T) {
+	pinnedDgst, _ := newRandomBlob(1024)
+	_, evilBlob := newRandomBlob(1024)
+
+	// Serve the evil bytes at the pinned digest's blob URL.
+	var m testutil.RequestResponseMap
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		resp := testutil.Response{
+			StatusCode: http.StatusOK,
+			Headers: http.Header(map[string][]string{
+				"Content-Length": {fmt.Sprint(len(evilBlob))},
+				"Content-Type":   {"application/octet-stream"},
+				"Last-Modified":  {time.Now().Add(-1 * time.Second).Format(time.ANSIC)},
+			}),
+		}
+		if method == http.MethodGet {
+			resp.Body = evilBlob
+		}
+		m = append(m, testutil.RequestResponseMapping{
+			Request: testutil.Request{
+				Method: method,
+				Route:  "/v2/test.example.com/repo1/blobs/" + pinnedDgst.String(),
+			},
+			Response: resp,
+		})
+	}
+
+	e, c := testServer(m)
+	defer c()
+
+	ctx := dcontext.Background()
+	repo, _ := reference.WithName("test.example.com/repo1")
+	r, err := NewRepository(repo, e, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := r.Blobs(ctx)
+
+	if _, err := l.Get(ctx, pinnedDgst); err == nil {
+		t.Fatal("Get accepted blob content that does not match the requested digest")
+	}
+}
+
+// TestBlobGetUnsupportedDigestAlgorithm ensures a syntactically valid digest
+// with an unavailable algorithm is rejected by Get rather than panicking
+// dgst.Verifier().
+func TestBlobGetUnsupportedDigestAlgorithm(t *testing.T) {
+	ctx := dcontext.Background()
+	repo, _ := reference.WithName("test.example.com/repo1")
+	r, err := NewRepository(repo, "http://localhost:5000", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := r.Blobs(ctx)
+
+	bad := digest.Digest("md5:0123456789abcdef0123456789abcdef")
+	if _, err := l.Get(ctx, bad); err == nil {
+		t.Fatal("Get accepted a digest with an unsupported algorithm")
+	}
+}
+
 func TestBlobExistsNoContentLength(t *testing.T) {
 	var m testutil.RequestResponseMap
 
@@ -440,7 +508,8 @@ func TestBlobUploadChunked(t *testing.T) {
 		b1[513:1024],
 	}
 	repo, _ := reference.WithName("test.example.com/uploadrepo")
-	uuids := []string{uuid.NewString()}
+	uuids := make([]string, 0, len(chunks)+1)
+	uuids = append(uuids, uuid.NewString())
 	m = append(m, testutil.RequestResponseMapping{
 		Request: testutil.Request{
 			Method: http.MethodPost,
@@ -918,7 +987,7 @@ func TestBlobMount(t *testing.T) {
 
 func newRandomOCIManifest(t *testing.T, blobCount int) (*ocischema.Manifest, digest.Digest, []byte) {
 	layers := make([]v1.Descriptor, blobCount)
-	for i := 0; i < blobCount; i++ {
+	for i := range blobCount {
 		dgst, blob := newRandomBlob((i % 5) * 16)
 		layers[i] = v1.Descriptor{
 			MediaType: v1.MediaTypeImageLayer,
@@ -1135,6 +1204,61 @@ func TestOCIManifestFetch(t *testing.T) {
 	_, err = ms.Get(ctx, dgst, distribution.WithTag("badcontenttype"))
 	if err == nil {
 		t.Fatal("expected to fail")
+	}
+}
+
+// TestManifestFetchByDigestVerifies ensures that a manifest requested by digest
+// is rejected when the registry returns content that does not hash to the
+// requested digest, even if it forges the Docker-Content-Digest header.
+// Regression test for GHSA-685w-q87j-wqw3.
+func TestManifestFetchByDigestVerifies(t *testing.T) {
+	ctx := dcontext.Background()
+	repo, _ := reference.WithName("test.example.com/repo")
+
+	// The manifest the caller pinned by digest.
+	_, pinnedDgst, _ := newRandomOCIManifest(t, 6)
+	// A different, attacker-chosen manifest the malicious server returns instead.
+	_, _, evilPayload := newRandomOCIManifest(t, 6)
+
+	var m testutil.RequestResponseMap
+	// Serve the evil payload at the pinned digest's URL, but lie in the
+	// Docker-Content-Digest header, claiming it matches what was requested.
+	m = append(m, testutil.RequestResponseMapping{
+		Request: testutil.Request{
+			Method: http.MethodGet,
+			Route:  "/v2/" + repo.Name() + "/manifests/" + pinnedDgst.String(),
+		},
+		Response: testutil.Response{
+			StatusCode: http.StatusOK,
+			Body:       evilPayload,
+			Headers: http.Header(map[string][]string{
+				"Content-Length":        {fmt.Sprint(len(evilPayload))},
+				"Last-Modified":         {time.Now().Add(-1 * time.Second).Format(time.ANSIC)},
+				"Content-Type":          {v1.MediaTypeImageManifest},
+				"Docker-Content-Digest": {pinnedDgst.String()}, // forged
+			}),
+		},
+	})
+
+	// Sanity check: the two manifests really are different.
+	if digest.FromBytes(evilPayload) == pinnedDgst {
+		t.Fatal("test setup error: evil payload matches pinned digest")
+	}
+
+	e, c := testServer(m)
+	defer c()
+
+	r, err := NewRepository(repo, e, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms, err := r.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ms.Get(ctx, pinnedDgst); err == nil {
+		t.Fatal("expected digest mismatch error, but Get accepted substituted content")
 	}
 }
 
@@ -1417,7 +1541,7 @@ func TestManifestTags(t *testing.T) {
 }
 	`))
 	var m testutil.RequestResponseMap
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		m = append(m, testutil.RequestResponseMapping{
 			Request: testutil.Request{
 				Method: http.MethodGet,
@@ -1580,8 +1704,8 @@ func TestManifestTagsPaginated(t *testing.T) {
 	repo, _ := reference.WithName("test.example.com/repo/tags/list")
 	tagsList := []string{"tag1", "tag2", "funtag"}
 	var m testutil.RequestResponseMap
-	for i := 0; i < 3; i++ {
-		body, err := json.Marshal(map[string]interface{}{
+	for i := range 3 {
+		body, err := json.Marshal(map[string]any{
 			"name": "test.example.com/repo/tags/list",
 			"tags": []string{tagsList[i]},
 		})
@@ -1656,6 +1780,88 @@ func TestManifestTagsPaginated(t *testing.T) {
 	}
 	if len(expected) != 0 {
 		t.Fatalf("unexpected tags returned: %v", expected)
+	}
+}
+
+func TestManifestTagsListPaginated(t *testing.T) {
+	s := httptest.NewServer(http.NotFoundHandler())
+	defer s.Close()
+
+	repo, _ := reference.WithName("test.example.com/repo/tags/list")
+	tagsList := []string{"tag1", "tag2", "funtag"}
+	var m testutil.RequestResponseMap
+	for i := range 3 {
+		body, err := json.Marshal(map[string]any{
+			"name": "test.example.com/repo/tags/list",
+			"tags": []string{tagsList[i]},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		queryParams := make(map[string][]string)
+		if i > 0 {
+			queryParams["n"] = []string{"1"}
+			queryParams["last"] = []string{tagsList[i-1]}
+		} else {
+			queryParams["n"] = []string{"1"}
+		}
+
+		// Test both relative and absolute links.
+		relativeLink := "/v2/" + repo.Name() + "/tags/list?n=1&last=" + tagsList[i]
+		var link string
+		switch i {
+		case 0:
+			link = relativeLink
+		case len(tagsList) - 1:
+			link = ""
+		default:
+			link = s.URL + relativeLink
+		}
+
+		headers := http.Header(map[string][]string{
+			"Content-Length": {fmt.Sprint(len(body))},
+			"Last-Modified":  {time.Now().Add(-1 * time.Second).Format(time.ANSIC)},
+		})
+		if link != "" {
+			headers.Set("Link", fmt.Sprintf(`<%s>; rel="next"`, link))
+		}
+
+		m = append(m, testutil.RequestResponseMapping{
+			Request: testutil.Request{
+				Method:      http.MethodGet,
+				Route:       "/v2/" + repo.Name() + "/tags/list",
+				QueryParams: queryParams,
+			},
+			Response: testutil.Response{
+				StatusCode: http.StatusOK,
+				Body:       body,
+				Headers:    headers,
+			},
+		})
+	}
+	s.Config.Handler = testutil.NewHandler(m)
+
+	r, err := NewRepository(repo, s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := dcontext.Background()
+	tagService := r.Tags(ctx)
+
+	last := ""
+	for i := range 3 {
+		tags, err := tagService.List(ctx, 1, last)
+		if err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		if len(tags) != 1 {
+			t.Fatalf("Wrong number of tags returned: %d, expected 1", len(tags))
+		}
+		if tags[0] != tagsList[i] {
+			t.Fatalf("Wrong tag returned: %s, expected %s", tags[0], tagsList[i])
+		}
+		last = tags[0]
 	}
 }
 
@@ -1800,7 +2006,7 @@ func TestSanitizeLocation(t *testing.T) {
 			expected:    "https://mwhahaha.com/v2/foo/baasdf?_state=asdfasfdasdfasdf",
 		},
 	} {
-		fatalf := func(format string, args ...interface{}) {
+		fatalf := func(format string, args ...any) {
 			t.Fatalf(testcase.description+": "+format, args...)
 		}
 

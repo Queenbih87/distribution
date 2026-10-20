@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/suite"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 )
 
 // configStruct is a canonical example configuration, which should map to configYamlV0_1
@@ -18,7 +18,7 @@ var configStruct = Configuration{
 	Version: "0.1",
 	Log: Log{
 		Level:  "info",
-		Fields: map[string]interface{}{"environment": "test"},
+		Fields: map[string]any{"environment": "test"},
 	},
 	Storage: Storage{
 		"somedriver": Parameters{
@@ -74,6 +74,9 @@ var configStruct = Configuration{
 		H2C: H2C{
 			Enabled: true,
 		},
+	},
+	Tags: Tags{
+		MaxTags: 1000,
 	},
 	Redis: Redis{
 		Options: RedisOptions{
@@ -139,6 +142,8 @@ notifications:
            - application/octet-stream
         actions:
            - pull
+tags:
+  maxtags: 1000
 http:
   tls:
     clientcas:
@@ -192,6 +197,8 @@ notifications:
            - application/octet-stream
         actions:
            - pull
+tags:
+  maxtags: 1000
 http:
   headers:
     X-Content-Type-Options: [nosniff]
@@ -395,10 +402,10 @@ func (suite *ConfigSuite) TestParseExtraneousVars() {
 // TestParseEnvVarImplicitMaps validates that environment variables can set
 // values in maps that don't already exist.
 func (suite *ConfigSuite) TestParseEnvVarImplicitMaps() {
-	readonly := make(map[string]interface{})
+	readonly := make(map[string]any)
 	readonly["enabled"] = true
 
-	maintenance := make(map[string]interface{})
+	maintenance := make(map[string]any)
 	maintenance["readonly"] = readonly
 
 	suite.expectedConfig.Storage["maintenance"] = maintenance
@@ -457,10 +464,25 @@ func (suite *ConfigSuite) TestParseEnvMany() {
 	suite.Require().NoError(err)
 }
 
+// TestParseEnvInlinedStruct tests whether environment variables are properly matched to fields in inlined structs.
+func (suite *ConfigSuite) TestParseEnvInlinedStruct() {
+	suite.expectedConfig.Redis.Options.Username = "bob"
+	suite.expectedConfig.Redis.Options.Password = "password123"
+
+	// Test without inlined struct name in the env variable name
+	suite.T().Setenv("REGISTRY_REDIS_USERNAME", "bob")
+	// Test with the inlined struct name in the env variable name, for backward compatibility
+	suite.T().Setenv("REGISTRY_REDIS_OPTIONS_PASSWORD", "password123")
+
+	config, err := Parse(bytes.NewReader([]byte(configYamlV0_1)))
+	suite.Require().NoError(err)
+	suite.Require().Equal(suite.expectedConfig, config)
+}
+
 func checkStructs(tt *testing.T, t reflect.Type, structsChecked map[string]struct{}) {
 	tt.Helper()
 
-	for t.Kind() == reflect.Ptr || t.Kind() == reflect.Map || t.Kind() == reflect.Slice {
+	for t.Kind() == reflect.Pointer || t.Kind() == reflect.Map || t.Kind() == reflect.Slice {
 		t = t.Elem()
 	}
 
@@ -497,7 +519,7 @@ func checkStructs(tt *testing.T, t reflect.Type, structsChecked map[string]struc
 // with yaml tags that would be ambiguous to the environment variable parser.
 func (suite *ConfigSuite) TestValidateConfigStruct() {
 	structsChecked := make(map[string]struct{})
-	checkStructs(suite.T(), reflect.TypeOf(Configuration{}), structsChecked)
+	checkStructs(suite.T(), reflect.TypeFor[Configuration](), structsChecked)
 }
 
 func copyConfig(config Configuration) *Configuration {
@@ -507,7 +529,7 @@ func copyConfig(config Configuration) *Configuration {
 	configCopy.Loglevel = config.Loglevel
 	configCopy.Log = config.Log
 	configCopy.Catalog = config.Catalog
-	configCopy.Log.Fields = make(map[string]interface{}, len(config.Log.Fields))
+	configCopy.Log.Fields = make(map[string]any, len(config.Log.Fields))
 	maps.Copy(configCopy.Log.Fields, config.Log.Fields)
 
 	configCopy.Storage = Storage{config.Storage.Type(): Parameters{}}
@@ -543,6 +565,8 @@ func copyConfig(config Configuration) *Configuration {
 		Disabled:  config.Validation.Disabled,
 		Manifests: config.Validation.Manifests,
 	}
+
+	configCopy.Tags = config.Tags
 
 	return configCopy
 }

@@ -162,6 +162,7 @@ storage:
     multipartcopythresholdsize: 33554432
     rootdirectory: /s3/object/name/prefix
     usedualstack: false
+    usefipsendpoint: false
     loglevel: debug
   inmemory:  # This driver takes no parameters
   tag:
@@ -222,6 +223,10 @@ middleware:
     - name: redirect
       options:
         baseurl: https://example.com/
+catalog:
+  maxentries: 1000
+tags:
+  maxtags: 1000
 http:
   addr: localhost:5000
   prefix: /my/nested/registry/
@@ -455,6 +460,7 @@ storage:
     multipartcopymaxconcurrency: 100
     multipartcopythresholdsize: 33554432
     rootdirectory: /s3/object/name/prefix
+    usefipsendpoint: false
     loglevel: debug
   inmemory:
   delete:
@@ -798,6 +804,46 @@ location of a proxy for the layer stored by the S3 storage driver.
 |-----------|----------|-------------------------------------------------------------------------------------------------------------|
 | `baseurl` | yes      | `SCHEME://HOST` at which layers are served. Can also contain port. For example, `https://example.com:5443`. |
 
+## `catalog`
+
+The `catalog` subsection provides configuration to limit the maximum number of
+entries returned in a single response from the catalog API endpoint
+(`/v2/_catalog`). When a client does not specify the `n` query parameter, at
+most 100 entries are returned. When a client requests more than `maxentries`
+via the `n` query parameter, the server rejects the request with a
+`400 Bad Request` response and a `PAGINATION_NUMBER_INVALID` error.
+
+The catalog endpoint is designed for registry synchronization with search or
+other API systems, and serving a request may put significant load on the
+backend storage. It is strongly recommended to keep this endpoint behind
+heightened privilege and avoid exposing it to the internet.
+
+```yaml
+catalog:
+  maxentries: 1000
+```
+
+| Parameter    | Required | Description                                                                               |
+|--------------|----------|-------------------------------------------------------------------------------------------|
+| `maxentries` | no       | Overrides the maximum number of entries returned by the catalog endpoint, default: `1000` |
+
+## `tags`
+
+The `tags` subsection provides configuration to limit the maximum number of tags
+returned in a single response from the tags API endpoint. When a client requests
+more than `maxtags` via the `n` query parameter, the server returns `maxtags`
+results along with a `Link` header so the client can paginate to retrieve the
+rest.
+
+```yaml
+tags: 
+  maxtags: 100
+```
+
+| Parameter | Required | Description                                                                         |
+|-----------|----------|-------------------------------------------------------------------------------------|
+| `maxtags` | no       | Overrides the maximum number of tags returned by the tags endpoint, default: `1000` |
+
 ## `http`
 
 ```yaml
@@ -1048,6 +1094,15 @@ accept event notifications.
 | `mediatypes`|no| A list of target media types to ignore. Events with these target media types are not published to the endpoint. |
 | `actions`   |no| A list of actions to ignore. Events with these actions are not published to the endpoint. |
 
+The `mediatypes` and `actions` filters work independently. You can specify:
+
+- Only `mediatypes` to filter by media type.
+- Only `actions` to filter by action (e.g., `pull`, `push`, `delete`, `mount`)
+- Both to filter events matching either condition (OR logic)
+- Neither to receive all events
+
+Common use case: Set `mediatypes: []` with `actions: [pull, delete, mount]` to receive only push events regardless of media type.
+
 ### `events`
 
 The `events` structure configures the information provided in event notifications.
@@ -1070,17 +1125,45 @@ Under the hood distribution uses [`go-redis`](https://github.com/redis/go-redis)
 Redis connectivity and its [`UniversalOptions`](https://pkg.go.dev/github.com/redis/go-redis/v9#UniversalOptions)
 struct.
 
+To use Redis Sentinel, set `mastername` to the name of the monitored Redis master
+and `addrs` to the Sentinel endpoints. Setting `mastername` selects the
+Sentinel-backed failover client; without it, multiple addresses select a Redis
+Cluster client instead.
+
+```yaml
+redis:
+  addrs:
+    - sentinel1.example.com:26379
+    - sentinel2.example.com:26379
+    - sentinel3.example.com:26379
+  mastername: mymaster
+```
+
+The equivalent environment variable for the master name is
+`REGISTRY_REDIS_MASTERNAME`. If authentication is required, use `username` and
+`password` for Redis, and `sentinelusername` and `sentinelpassword` for Sentinel.
+
 You can optionally specify TLS configuration on top of the `UniversalOptions` settings.
 
 Use these settings to configure Redis TLS:
 
 | Parameter | Required | Description                                           |
 |-----------|----------|-------------------------------------------------------|
-| `certificate`  | yes  | Absolute path to the x509 certificate file.           |
-| `key`          | yes  | Absolute path to the x509 private key file.           |
+| `certificate`  | no   | Absolute path to the x509 client certificate file. Required for mTLS.  |
+| `key`          | no   | Absolute path to the x509 client private key file. Required for mTLS.  |
 | `rootcas`      | no   | An array of absolute paths to x509 CA files.          |
 
+**Note:** For server-side TLS only (e.g., AWS Elasticache), provide only `rootcas`. For mutual TLS (mTLS), provide both `certificate` and `key` along with optional `rootcas`.
+
 ```yaml
+# Server-side TLS only (validate server certificate)
+redis:
+  tls:
+    rootcas:
+      - /path/to/ca-bundle.crt
+  addrs: [localhost:6379]
+
+# Mutual TLS (client and server certificates)
 redis:
   tls:
     certificate: /path/to/cert.crt
@@ -1296,7 +1379,7 @@ index manifests uploaded to the registry.
 
 ##### `platforms`
 
-Set `platformexist` to `all` (the default) to validate all platform images exist.
+Set `platforms` to `all` (the default) to validate all platform images exist.
 The registry will validate that the images referenced by the index exist in the
 registry before accepting the image index.
 

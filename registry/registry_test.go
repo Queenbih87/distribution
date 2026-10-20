@@ -2,6 +2,7 @@ package registry
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -11,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -28,7 +30,7 @@ import (
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 )
 
 // Tests to ensure nextProtos returns the correct protocols when:
@@ -53,6 +55,61 @@ func TestNextProtos(t *testing.T) {
 	}
 }
 
+func TestServerProtocols(t *testing.T) {
+	tests := []struct {
+		name          string
+		h2cEnabled    bool
+		http2Disabled bool
+		wantNil       bool
+		wantHTTP2     bool
+	}{
+		{
+			name:    "default protocols",
+			wantNil: true,
+		},
+		{
+			name:       "h2c enabled",
+			h2cEnabled: true,
+			wantHTTP2:  true,
+		},
+		{
+			name:          "h2c enabled with tls http2 disabled",
+			h2cEnabled:    true,
+			http2Disabled: true,
+			wantHTTP2:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &configuration.Configuration{}
+			config.HTTP.H2C.Enabled = tt.h2cEnabled
+			config.HTTP.HTTP2.Disabled = tt.http2Disabled
+
+			protocols := serverProtocols(config)
+			if tt.wantNil {
+				if protocols != nil {
+					t.Fatalf("expected nil protocols, got %s", protocols)
+				}
+				return
+			}
+			if protocols == nil {
+				t.Fatal("expected protocols, got nil")
+				return
+			}
+			if !protocols.HTTP1() {
+				t.Fatal("expected HTTP/1 to be enabled")
+			}
+			if got := protocols.HTTP2(); got != tt.wantHTTP2 {
+				t.Fatalf("HTTP/2 enabled = %v, want %v", got, tt.wantHTTP2)
+			}
+			if !protocols.UnencryptedHTTP2() {
+				t.Fatal("expected unencrypted HTTP/2 to be enabled")
+			}
+		})
+	}
+}
+
 type registryTLSConfig struct {
 	cipherSuites    []string
 	certificatePath string
@@ -60,10 +117,23 @@ type registryTLSConfig struct {
 	certificate     *tls.Certificate
 }
 
+// freeTCPAddr reserves an ephemeral local TCP address for tests so we do not
+// collide with a developer registry already bound to :5000/:5001.
+func freeTCPAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return addr
+}
+
 func setupRegistry(tlsCfg *registryTLSConfig, addr string) (*Registry, error) {
 	config := &configuration.Configuration{}
-	// TODO: this needs to change to something ephemeral as the test will fail if there is any server
-	// already listening on port 5000
 	config.HTTP.Addr = addr
 	config.HTTP.DrainTimeout = time.Duration(10) * time.Second
 	if tlsCfg != nil {
@@ -71,12 +141,13 @@ func setupRegistry(tlsCfg *registryTLSConfig, addr string) (*Registry, error) {
 		config.HTTP.TLS.Certificate = tlsCfg.certificatePath
 		config.HTTP.TLS.Key = tlsCfg.privateKeyPath
 	}
-	config.Storage = map[string]configuration.Parameters{"inmemory": map[string]interface{}{}}
+	config.Storage = map[string]configuration.Parameters{"inmemory": map[string]any{}}
 	return NewRegistry(context.Background(), config)
 }
 
 func TestGracefulShutdown(t *testing.T) {
-	registry, err := setupRegistry(nil, ":5000")
+	addr := freeTCPAddr(t)
+	registry, err := setupRegistry(nil, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,14 +165,14 @@ func TestGracefulShutdown(t *testing.T) {
 	// Wait for some unknown random time for server to start listening
 	time.Sleep(3 * time.Second)
 
-	//Establish connection
-	conn, err := net.Dial("tcp", "localhost:5000")
+	// Establish connection
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Send a complete, valid HTTP/1.1 request
-	_, err = fmt.Fprintf(conn, "GET /v2/ HTTP/1.1\r\nHost: localhost:5000\r\n\r\n")
+	_, err = fmt.Fprintf(conn, "GET /v2/ HTTP/1.1\r\nHost: %s\r\n\r\n", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +184,7 @@ func TestGracefulShutdown(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// try connecting again - it should be rejected during graceful shutdown
-	conn2, err := net.Dial("tcp", "localhost:5000")
+	conn2, err := net.Dial("tcp", addr)
 	if err == nil {
 		conn2.Close()
 		t.Fatal("Managed to connect after stopping.")
@@ -177,7 +248,7 @@ func TestGetCipherSuite(t *testing.T) {
 }
 
 func buildRegistryTLSConfig(name, keyType string, cipherSuites []string) (*registryTLSConfig, error) {
-	var priv interface{}
+	var priv any
 	var pub crypto.PublicKey
 	var err error
 	switch keyType {
@@ -281,13 +352,14 @@ func TestRegistrySupportedCipherSuite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	registry, err := setupRegistry(serverTLS, ":5001")
+	addr := freeTCPAddr(t)
+	registry, err := setupRegistry(serverTLS, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// run registry server
-	var errchan chan error
+	errchan := make(chan error, 1)
 	go func() {
 		errchan <- registry.ListenAndServe()
 	}()
@@ -312,7 +384,7 @@ func TestRegistrySupportedCipherSuite(t *testing.T) {
 	dialer := net.Dialer{
 		Timeout: time.Second * 5,
 	}
-	conn, err := tls.DialWithDialer(&dialer, "tcp", "127.0.0.1:5001", &clientTLS)
+	conn, err := tls.DialWithDialer(&dialer, "tcp", addr, &clientTLS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,13 +414,14 @@ func TestRegistryUnsupportedCipherSuite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	registry, err := setupRegistry(serverTLS, ":5002")
+	addr := freeTCPAddr(t)
+	registry, err := setupRegistry(serverTLS, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// run registry server
-	var errchan chan error
+	errchan := make(chan error, 1)
 	go func() {
 		errchan <- registry.ListenAndServe()
 	}()
@@ -369,7 +442,7 @@ func TestRegistryUnsupportedCipherSuite(t *testing.T) {
 	dialer := net.Dialer{
 		Timeout: time.Second * 5,
 	}
-	_, err = tls.DialWithDialer(&dialer, "tcp", "127.0.0.1:5002", &clientTLS)
+	_, err = tls.DialWithDialer(&dialer, "tcp", addr, &clientTLS)
 	if err == nil {
 		t.Error("expected TLS connection to timeout")
 	}
@@ -432,5 +505,42 @@ log:
 	val, ok = entry.Data["baz"].(string)
 	if !ok || val != "xyzzy" {
 		t.Error("field baz not configured correctly; expected 'xyzzy' got: ", val)
+	}
+}
+
+func TestConfigureLoggingFormatterLogStash(t *testing.T) {
+	_, err := configureLogging(t.Context(), &configuration.Configuration{
+		Log: configuration.Log{
+			Level:        "info",
+			Formatter:    "logstash",
+			ReportCaller: true,
+		},
+	})
+	if err != nil {
+		t.Fatal("failed to configure logging: ", err)
+	}
+
+	var buf bytes.Buffer
+	logrus.SetOutput(&buf)
+	t.Cleanup(func() {
+		logrus.SetOutput(os.Stderr)
+	})
+
+	logger := dcontext.GetLogger(t.Context())
+	logger.Info("test")
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := got["function"]; !ok {
+		t.Error(`expected "function" field`)
+	}
+	if _, ok := got["file"]; !ok {
+		t.Error(`expected "file" field`)
+	}
+	if _, ok := got["func"]; ok {
+		t.Error(`unexpected "func" field`)
 	}
 }

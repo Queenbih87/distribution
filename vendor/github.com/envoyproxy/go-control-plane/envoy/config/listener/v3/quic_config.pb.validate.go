@@ -363,6 +363,68 @@ func (m *QuicProtocolOptions) validate(all bool) error {
 		}
 	}
 
+	if len(m.GetSaveCmsgConfig()) > 1 {
+		err := QuicProtocolOptionsValidationError{
+			field:  "SaveCmsgConfig",
+			reason: "value must contain no more than 1 item(s)",
+		}
+		if !all {
+			return err
+		}
+		errors = append(errors, err)
+	}
+
+	for idx, item := range m.GetSaveCmsgConfig() {
+		_, _ = idx, item
+
+		if all {
+			switch v := interface{}(item).(type) {
+			case interface{ ValidateAll() error }:
+				if err := v.ValidateAll(); err != nil {
+					errors = append(errors, QuicProtocolOptionsValidationError{
+						field:  fmt.Sprintf("SaveCmsgConfig[%v]", idx),
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			case interface{ Validate() error }:
+				if err := v.Validate(); err != nil {
+					errors = append(errors, QuicProtocolOptionsValidationError{
+						field:  fmt.Sprintf("SaveCmsgConfig[%v]", idx),
+						reason: "embedded message failed validation",
+						cause:  err,
+					})
+				}
+			}
+		} else if v, ok := interface{}(item).(interface{ Validate() error }); ok {
+			if err := v.Validate(); err != nil {
+				return QuicProtocolOptionsValidationError{
+					field:  fmt.Sprintf("SaveCmsgConfig[%v]", idx),
+					reason: "embedded message failed validation",
+					cause:  err,
+				}
+			}
+		}
+
+	}
+
+	// no validation rules for RejectNewConnections
+
+	if wrapper := m.GetMaxSessionsPerEventLoop(); wrapper != nil {
+
+		if wrapper.GetValue() <= 0 {
+			err := QuicProtocolOptionsValidationError{
+				field:  "MaxSessionsPerEventLoop",
+				reason: "value must be greater than 0",
+			}
+			if !all {
+				return err
+			}
+			errors = append(errors, err)
+		}
+
+	}
+
 	if len(errors) > 0 {
 		return QuicProtocolOptionsMultiError(errors)
 	}
@@ -377,7 +439,7 @@ type QuicProtocolOptionsMultiError []error
 
 // Error returns a concatenation of all the error messages it wraps.
 func (m QuicProtocolOptionsMultiError) Error() string {
-	var msgs []string
+	msgs := make([]string, 0, len(m))
 	for _, err := range m {
 		msgs = append(msgs, err.Error())
 	}

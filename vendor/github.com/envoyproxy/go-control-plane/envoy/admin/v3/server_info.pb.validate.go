@@ -193,7 +193,7 @@ type ServerInfoMultiError []error
 
 // Error returns a concatenation of all the error messages it wraps.
 func (m ServerInfoMultiError) Error() string {
-	var msgs []string
+	msgs := make([]string, 0, len(m))
 	for _, err := range m {
 		msgs = append(msgs, err.Error())
 	}
@@ -301,6 +301,8 @@ func (m *CommandLineOptions) validate(all bool) error {
 
 	// no validation rules for IgnoreUnknownDynamicFields
 
+	// no validation rules for SkipDeprecatedLogs
+
 	// no validation rules for AdminAddressPath
 
 	// no validation rules for LocalAddressIpVersion
@@ -349,6 +351,8 @@ func (m *CommandLineOptions) validate(all bool) error {
 			}
 		}
 	}
+
+	// no validation rules for FileFlushMinSize
 
 	if all {
 		switch v := interface{}(m.GetDrainTime()).(type) {
@@ -442,7 +446,7 @@ type CommandLineOptionsMultiError []error
 
 // Error returns a concatenation of all the error messages it wraps.
 func (m CommandLineOptionsMultiError) Error() string {
-	var msgs []string
+	msgs := make([]string, 0, len(m))
 	for _, err := range m {
 		msgs = append(msgs, err.Error())
 	}

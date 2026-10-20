@@ -17,16 +17,18 @@ import (
 func TestFileHealthCheck(t *testing.T) {
 	interval := time.Second
 
-	tmpfile, err := os.CreateTemp(os.TempDir(), "healthcheck")
+	tmpfile, err := os.CreateTemp(t.TempDir(), "healthcheck")
 	if err != nil {
 		t.Fatalf("could not create temporary file: %v", err)
 	}
-	defer tmpfile.Close()
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	config := &configuration.Configuration{
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
@@ -57,7 +59,9 @@ func TestFileHealthCheck(t *testing.T) {
 		t.Fatal(`did not get "file exists" result for health check`)
 	}
 
-	os.Remove(tmpfile.Name())
+	if err := os.Remove(tmpfile.Name()); err != nil {
+		t.Fatal(err)
+	}
 
 	<-time.After(2 * interval)
 	if len(healthRegistry.CheckStatus(ctx)) != 0 {
@@ -89,7 +93,7 @@ func TestTCPHealthCheck(t *testing.T) {
 	config := &configuration.Configuration{
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
@@ -151,7 +155,7 @@ func TestHTTPHealthCheck(t *testing.T) {
 	config := &configuration.Configuration{
 		Storage: configuration.Storage{
 			"inmemory": configuration.Parameters{},
-			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
+			"maintenance": configuration.Parameters{"uploadpurging": map[any]any{
 				"enabled": false,
 			}},
 		},
